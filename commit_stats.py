@@ -206,13 +206,10 @@ def collect_all_stats(player: str) -> dict:
             totals["total_lines_written"] += s["lines_written"]
             totals["total_cost"] += s["cost"]
             totals["total_active_hours"] += s["active_seconds"] / 3600
-            for key in ("first_ts", "last_ts"):
-                v = s[key]
-                if not v:
-                    continue
-                side = "earliest_session" if key == "first_ts" else "latest_session"
-                if not totals[side] or v < totals[side] if side == "earliest_session" else v > totals[side]:
-                    totals[side] = v
+            if s["first_ts"] and (not totals["earliest_session"] or s["first_ts"] < totals["earliest_session"]):
+                totals["earliest_session"] = s["first_ts"]
+            if s["last_ts"] and (not totals["latest_session"] or s["last_ts"] > totals["latest_session"]):
+                totals["latest_session"] = s["last_ts"]
             pname = s["project"] or "Other"
             p = totals["projects"].setdefault(pname, {
                 "sessions": 0, "prompts": 0, "api_calls": 0,
