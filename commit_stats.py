@@ -29,6 +29,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+GST = timezone(timedelta(hours=4))  # UAE
 PLAYER_NAME = os.environ.get("PLAYER_NAME", "").strip()
 TOKEN_FILE = Path(os.environ.get("TOKEN_FILE", str(Path.home() / ".claude" / ".thefel1991_token")))
 DATA_REPO = os.environ.get("DATA_REPO", "thefel1991/leaderboard-data")
@@ -71,12 +72,50 @@ def cost_for(inp, out, cr, cw, model):
     return inp * p["input"] + out * p["output"] + cr * p["cache_read"] + cw * p["cache_write"]
 
 
+def _bucket_date(ts): return ts.astimezone(GST).strftime("%Y-%m-%d")
+def _parse_day_key(k):
+    try:
+        return datetime.strptime(k, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+def _is_after_hours(ts):
+    local = ts.astimezone(GST)
+    wd = local.weekday()  # Mon=0..Sun=6
+    if wd in (4, 5):  # Fri, Sat = UAE weekend
+        return True
+    return local.hour < 9 or local.hour >= 18
+
+
 def parse_jsonl(filepath: Path) -> dict:
-    """Parse a single session JSONL and return a stats dict."""
+    """Parse a single session JSONL. Returns aggregate stats + per_day dict
+    compatible with the dashboard's daily_buckets schema."""
     timestamps = []
     human = api = inp_t = out_t = cr_t = cw_t = lines = 0
     cost = 0.0
     project_votes: dict[str, int] = {}
+    per_day: dict[str, dict] = {}
+
+    def bucket(ts):
+        key = _bucket_date(ts)
+        b = per_day.get(key)
+        if b is None:
+            b = {
+                "timestamps": [], "prompts": 0, "api_calls": 0,
+                "after_hours_prompts": 0, "lines": 0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read": 0, "cache_write": 0,
+                "tool_calls": {}, "models": {},
+                "first_ts_gst": None, "last_ts_gst": None,
+            }
+            per_day[key] = b
+        b["timestamps"].append(ts)
+        local = ts.astimezone(GST)
+        if b["first_ts_gst"] is None or local < b["first_ts_gst"]:
+            b["first_ts_gst"] = local
+        if b["last_ts_gst"] is None or local > b["last_ts_gst"]:
+            b["last_ts_gst"] = local
+        return b
+
     try:
         with filepath.open("r", errors="replace") as f:
             for line in f:
@@ -84,10 +123,14 @@ def parse_jsonl(filepath: Path) -> dict:
                     msg = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
                     continue
+                ts = None
+                day_b = None
                 ts_str = msg.get("timestamp")
                 if ts_str:
                     try:
-                        timestamps.append(datetime.fromisoformat(ts_str.replace("Z", "+00:00")))
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        timestamps.append(ts)
+                        day_b = bucket(ts)
                     except (ValueError, TypeError):
                         pass
                 cwd = msg.get("cwd", "") or ""
@@ -103,9 +146,14 @@ def parse_jsonl(filepath: Path) -> dict:
                            isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip()
                            for c in content)):
                         human += 1
+                        if day_b is not None:
+                            day_b["prompts"] += 1
+                            if ts is not None and _is_after_hours(ts):
+                                day_b["after_hours_prompts"] += 1
                 if mtype == "assistant":
                     api += 1
                     model = inner.get("model", "unknown")
+                    fam = model_family(model)
                     usage = inner.get("usage") or {}
                     i = usage.get("input_tokens", 0) or 0
                     o = usage.get("output_tokens", 0) or 0
@@ -113,13 +161,27 @@ def parse_jsonl(filepath: Path) -> dict:
                     cw = usage.get("cache_creation_input_tokens", 0) or 0
                     inp_t += i; out_t += o; cr_t += cr; cw_t += cw
                     cost += cost_for(i, o, cr, cw, model)
+                    if day_b is not None:
+                        day_b["api_calls"] += 1
+                        day_b["input_tokens"] += i
+                        day_b["output_tokens"] += o
+                        day_b["cache_read"] += cr
+                        day_b["cache_write"] += cw
+                        day_b["models"][fam] = day_b["models"].get(fam, 0) + 1
                     for block in (inner.get("content") or []):
                         if isinstance(block, dict) and block.get("type") == "tool_use":
+                            name = block.get("name", "")
+                            if day_b is not None:
+                                day_b["tool_calls"][name] = day_b["tool_calls"].get(name, 0) + 1
                             bi = block.get("input") or {}
-                            if block.get("name") == "Write" and bi.get("content"):
-                                lines += bi["content"].count("\n") + 1
-                            elif block.get("name") == "Edit" and bi.get("new_string"):
-                                lines += bi["new_string"].count("\n") + 1
+                            delta = 0
+                            if name == "Write" and bi.get("content"):
+                                delta = bi["content"].count("\n") + 1
+                            elif name == "Edit" and bi.get("new_string"):
+                                delta = bi["new_string"].count("\n") + 1
+                            lines += delta
+                            if delta and day_b is not None:
+                                day_b["lines"] += delta
     except OSError:
         pass
 
@@ -129,6 +191,31 @@ def parse_jsonl(filepath: Path) -> dict:
         gap = (timestamps[i] - timestamps[i - 1]).total_seconds()
         if gap <= IDLE_THRESHOLD:
             active += gap
+
+    # Per-day active time: same gap algorithm, bucketed
+    per_day_final = {}
+    for key, b in per_day.items():
+        ts_list = sorted(b["timestamps"])
+        day_active = 0
+        for i in range(1, len(ts_list)):
+            gap = (ts_list[i] - ts_list[i - 1]).total_seconds()
+            if gap <= IDLE_THRESHOLD:
+                day_active += gap
+        per_day_final[key] = {
+            "active_sec": int(day_active),
+            "prompts": b["prompts"],
+            "api_calls": b["api_calls"],
+            "after_hours_prompts": b["after_hours_prompts"],
+            "lines": b["lines"],
+            "input_tokens": b["input_tokens"],
+            "output_tokens": b["output_tokens"],
+            "cache_read": b["cache_read"],
+            "cache_write": b["cache_write"],
+            "tool_calls": dict(b["tool_calls"]),
+            "models": dict(b["models"]),
+            "first_hhmm": b["first_ts_gst"].strftime("%H:%M") if b["first_ts_gst"] else "",
+            "last_hhmm": b["last_ts_gst"].strftime("%H:%M") if b["last_ts_gst"] else "",
+        }
 
     dominant = max(project_votes, key=project_votes.get) if project_votes else None
     return {
@@ -140,6 +227,7 @@ def parse_jsonl(filepath: Path) -> dict:
         "project": dominant,
         "first_ts": timestamps[0].isoformat() if timestamps else None,
         "last_ts": timestamps[-1].isoformat() if timestamps else None,
+        "per_day": per_day_final,
     }
 
 
@@ -173,6 +261,39 @@ def extract_project(path: str) -> str | None:
     return first
 
 
+def merge_per_day(target: dict, source: dict):
+    """Merge per-day buckets from one session into running totals."""
+    for key, src in source.items():
+        t = target.get(key)
+        if t is None:
+            t = {
+                "active_sec": 0, "prompts": 0, "api_calls": 0,
+                "after_hours_prompts": 0, "lines": 0, "sessions": 0, "cost": 0.0,
+                "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0,
+                "tool_calls": {}, "models": {},
+                "first_hhmm": "", "last_hhmm": "",
+            }
+            target[key] = t
+        t["active_sec"] += src.get("active_sec", 0)
+        t["prompts"] += src.get("prompts", 0)
+        t["api_calls"] += src.get("api_calls", 0)
+        t["after_hours_prompts"] += src.get("after_hours_prompts", 0)
+        t["lines"] += src.get("lines", 0)
+        t["input_tokens"] += src.get("input_tokens", 0)
+        t["output_tokens"] += src.get("output_tokens", 0)
+        t["cache_read"] += src.get("cache_read", 0)
+        t["cache_write"] += src.get("cache_write", 0)
+        for name, count in (src.get("tool_calls") or {}).items():
+            t["tool_calls"][name] = t["tool_calls"].get(name, 0) + count
+        for fam, count in (src.get("models") or {}).items():
+            t["models"][fam] = t["models"].get(fam, 0) + count
+        sf, sl = src.get("first_hhmm", ""), src.get("last_hhmm", "")
+        if sf and (not t["first_hhmm"] or sf < t["first_hhmm"]):
+            t["first_hhmm"] = sf
+        if sl and (not t["last_hhmm"] or sl > t["last_hhmm"]):
+            t["last_hhmm"] = sl
+
+
 def collect_all_stats(player: str) -> dict:
     totals = {
         "player": player,
@@ -185,6 +306,7 @@ def collect_all_stats(player: str) -> dict:
         "total_active_hours": 0.0,
         "earliest_session": None, "latest_session": None,
         "projects": {},
+        "daily_buckets": {},
     }
     if not PROJECTS_DIR.exists():
         return totals
@@ -226,6 +348,35 @@ def collect_all_stats(player: str) -> dict:
             p["cache_write"] += s["cache_write"]
             p["lines_written"] += s["lines_written"]
             p["cost"] += s["cost"]
+
+            # Merge per-day buckets; also bump the session count on the day
+            # the session started.
+            if s.get("per_day"):
+                merge_per_day(totals["daily_buckets"], s["per_day"])
+            if s.get("first_ts"):
+                try:
+                    first_ts = datetime.fromisoformat(s["first_ts"].replace("Z", "+00:00"))
+                    day_key = _bucket_date(first_ts)
+                    b = totals["daily_buckets"].setdefault(day_key, {
+                        "active_sec": 0, "prompts": 0, "api_calls": 0,
+                        "after_hours_prompts": 0, "lines": 0, "sessions": 0, "cost": 0.0,
+                        "input_tokens": 0, "output_tokens": 0,
+                        "cache_read": 0, "cache_write": 0,
+                        "tool_calls": {}, "models": {},
+                        "first_hhmm": "", "last_hhmm": "",
+                    })
+                    b["sessions"] = b.get("sessions", 0) + 1
+                    b["cost"] = round(b.get("cost", 0.0) + s["cost"], 2)
+                except (ValueError, TypeError):
+                    pass
+
+    # Trim daily_buckets to last 90 days (GST) to match dashboard
+    today_gst = datetime.now(timezone.utc).astimezone(GST).date()
+    cutoff = today_gst - timedelta(days=90)
+    totals["daily_buckets"] = {
+        k: v for k, v in totals["daily_buckets"].items()
+        if _parse_day_key(k) and _parse_day_key(k) >= cutoff
+    }
 
     totals["total_cost"] = round(totals["total_cost"], 2)
     totals["total_active_hours"] = round(totals["total_active_hours"], 2)
